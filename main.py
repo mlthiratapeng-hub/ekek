@@ -41,54 +41,59 @@ async def api_req(method, endpoint, token, json_data=None):
                     return None, resp.status
             return None, resp.status
 
-# ระบบตรวจสอบ Token และ สิทธิ์ (เช็คสิทธิ์เฉพาะดิสปลายทางเท่านั้น)
+# ระบบตรวจสอบ Token และ สิทธิ์การใช้งานแบบใหม่ (ไม่จำเป็นต้องเป็นหัวดิส)
 async def check_permissions(token, src_id, dst_id, check_type):
     # 1. เช็คว่า User Token ถูกต้องไหม
     user, st = await api_req("GET", "/users/@me", token)
-    if st != 200:
+    if st != 200 or not user:
         return False, "<a:1000035604:1553747969176764486> UserToken ไม่ถูกต้องหรือหมดอายุอ้าาา"
 
-    # 2. เช็คว่าอยู่ในดิสต้นทางไหม (แค่อยู่ก็พอ ไม่ต้องมียศ)
-    src_guild, st_src = await api_req("GET", f"/guilds/{src_id}", token)
-    if st_src != 200:
+    # 2. ดึงลิสเซิร์ฟเวอร์ทั้งหมดที่ Token นี้อยู่ผ่าน /users/@me/guilds (ไม่ติด 403 แม้ไม่ใช่หัวดิส)
+    user_guilds, st_g = await api_req("GET", "/users/@me/guilds", token)
+    if st_g != 200 or user_guilds is None:
+        return False, "<a:1000035604:1553747969176764486> ไม่สามารถดึงข้อมูลดิสจาก UserToken ได้"
+
+    src_guild = next((g for g in user_guilds if str(g['id']) == str(src_id)), None)
+    dst_guild = next((g for g in user_guilds if str(g['id']) == str(dst_id)), None)
+
+    # 3. เช็คว่าอยู่ในดิสต้นทางไหม
+    if not src_guild:
         if check_type == 'emoji':
             return False, "<a:1000035604:1553747969176764486> UserTokenไม่อยู่ในดิสต้นทางอ้าาา"
         else:
             return False, "<a:1000035604:1553747969176764486> Tokenไม่อยู่ดิสต้นทาง"
 
-    # 3. เช็คว่าอยู่ในดิสปลายทางไหม
-    dst_guild, st_dst = await api_req("GET", f"/guilds/{dst_id}", token)
-    if st_dst != 200:
+    # 4. เช็คว่าอยู่ในดิสปลายทางไหม
+    if not dst_guild:
         if check_type == 'emoji':
             return False, "<a:1000035604:1553747969176764486> UserTokenไม่อยู่ในดิสปรายทางอ้าาา"
         else:
             return False, "<a:1000035604:1553747969176764486> tokenไม่อยู่ดิสปรายทาง"
 
-    # 4. เช็คสิทธิ์เฉพาะใน "ดิสปลายทาง"
-    # ดึงข้อมูลตัวเองในดิสปลายทาง
-    member, st_mem = await api_req("GET", f"/guilds/{dst_id}/members/@me", token)
-    roles, _ = await api_req("GET", f"/guilds/{dst_id}/roles", token)
-    
-    is_owner = (dst_guild.get("owner_id") == user.get("id"))
-    has_perm = is_owner
+    # 5. เช็คสิทธิ์ในดิสปลายทางจาก Permission Bitfield ของ UserToken ทันที
+    is_owner = dst_guild.get("owner", False)
+    dst_perms = int(dst_guild.get("permissions", 0))
 
-    if not is_owner and member and roles:
-        user_role_ids = member.get("roles", [])
-        for r in roles:
-            if r['id'] in user_role_ids or r['id'] == dst_id: # รวมบทบาท @everyone
-                perms = int(r.get("permissions", 0))
-                # ADMINISTRATOR (0x8)
-                if (perms & 0x8) == 0x8:
-                    has_perm = True
-                    break
-                # MANAGE_EMOJIS_AND_STICKERS (0x40000000)
-                if check_type == 'emoji' and (perms & 0x40000000) == 0x40000000:
-                    has_perm = True
-                    break
-                # MANAGE_ROLES (0x10000000)
-                if check_type in ['role', 'all'] and (perms & 0x10000000) == 0x10000000:
-                    has_perm = True
-                    break
+    # Bitwise Permission Flags:
+    # ADMINISTRATOR = 0x8 (8)
+    # MANAGE_ROLES = 0x10000000 (268435456)
+    # MANAGE_EMOJIS_AND_STICKERS = 0x40000000 (1073741824)
+    # MANAGE_CHANNELS = 0x10 (16)
+
+    has_admin = (dst_perms & 0x8) == 0x8
+    has_emoji_perm = (dst_perms & 0x40000000) == 0x40000000
+    has_role_perm = (dst_perms & 0x10000000) == 0x10000000
+    has_channel_perm = (dst_perms & 0x10) == 0x10
+
+    has_perm = False
+    if is_owner or has_admin:
+        has_perm = True
+    elif check_type == 'emoji':
+        has_perm = has_emoji_perm
+    elif check_type == 'role':
+        has_perm = has_role_perm
+    elif check_type == 'all':
+        has_perm = has_role_perm or has_channel_perm or has_emoji_perm
 
     if not has_perm:
         if check_type == 'emoji':
@@ -241,10 +246,8 @@ class ConfirmActionView(discord.ui.View):
                 await api_req("DELETE", f"/channels/{c['id']}", self.token)
                 await asyncio.sleep(0.2)
 
-            # 2. เปลี่ยนชื่อดิสปลายทางให้เหมือนต้นทาง
-            src_guild, _ = await api_req("GET", f"/guilds/{self.src_id}", self.token)
-            if src_guild:
-                await api_req("PATCH", f"/guilds/{self.dst_id}", self.token, {"name": src_guild.get('name')})
+            # 2. เปลี่ยนชื่อดิสปลายทางให้เหมือนต้นทาง (ถ้ามีสิทธิ์)
+            await api_req("PATCH", f"/guilds/{self.dst_id}", self.token, {"name": self.src_name})
 
             # 3. ก็อปยศ
             roles, _ = await api_req("GET", f"/guilds/{self.src_id}/roles", self.token)
@@ -277,7 +280,7 @@ class ConfirmActionView(discord.ui.View):
                     "topic": ch.get('topic'),
                     "bitrate": ch.get('bitrate'),
                     "user_limit": ch.get('user_limit'),
-                    "rate_limit_per_user": ch.get('rate_limit_per_user'), # โหมดช้า
+                    "rate_limit_per_user": ch.get('rate_limit_per_user'),
                     "parent_id": cat_map.get(ch.get('parent_id'))
                 }
                 await api_req("POST", f"/guilds/{self.dst_id}/channels", self.token, payload)
